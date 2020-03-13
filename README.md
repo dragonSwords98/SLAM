@@ -1,2 +1,4 @@
 # SLAM
-geohot SLAM follow-along
+Following Along with geohot's livecoding session where he built a toy version of SLAM.
+
+Effectively introducing me to SLAM, essential and fundamental matrices, using python, ruby, C++ to build a virtual environment, and corner and feature detection with OpenCV.

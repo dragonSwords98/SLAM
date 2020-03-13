@@ -6,11 +6,13 @@ from skimage.measure import ransac
 # from skimage.transform import FundamentalMatrixTransform
 from skimage.transform import EssentialMatrixTransform
 
+IRt = np.eye(4)
 
 class Frame(object):
   def __init__(self, img, K):
     self.K = K
     self.Kinv = np.linalg.inv(self.K)
+    self.pose = IRt
 
     pts, self.des = extract(img)
     self.pts = normalize(self.Kinv, pts)
@@ -20,7 +22,7 @@ class Frame(object):
 def add_ones(x):
     return np.concatenate([x, np.ones((x.shape[0], 1))], axis=1)
 
-
+# pose
 # Essential Matrix, Determining R ant t from E
 # rotation & translation
 def extractRt(E):
@@ -33,10 +35,15 @@ def extractRt(E):
     if np.sum(R.diagonal()) < 0:
         R = np.dot(np.dot(U, W.T), Vt)
     t = U[:, 2]
-    Rt = np.concatenate([R, t.reshape(3, 1)], axis=1)
-    return Rt
+    ret = np.eye(4)
+    ret[:3, :3] = R
+    ret[:3, 3] = t
+    return ret
+    # Rt = np.concatenate([R, t.reshape(3, 1)], axis=1)
+    # return Rt
 
 
+# When a frame is created, we want to extract the good features into an np.array.
 def extract(img):
     # orb = cv2.ORB_create(nfeatures=1500, scoreType=cv2.ORB_FAST_SCORE)
     # orb = cv2.ORB_create(nfeatures=1500, scoreType=cv2.ORB_HARRIS_SCORE)
@@ -63,21 +70,28 @@ def denormalize(K, pt):
     # return np.dot(Kinv, [pt[0], pt[1], 1.0])
 
 
-def match(f1, f2):
+def match_frames(f1, f2):
     bf = cv2.BFMatcher(cv2.NORM_HAMMING)
     # matcher = cv2.FlannBasedMatcher()
     matches = bf.knnMatch(f1.des, f2.des, k=2)
 
     # Lowe's ratio test
     ret = []
+    idx1, idx2 = [], []
+
     for m,n in matches:
         if m.distance < 0.75*n.distance:
+            # indices
+            idx1.append(m.queryIdx)
+            idx2.append(m.trainIdx)
+
             p1 = f1.pts[m.queryIdx]
             p2 = f2.pts[m.trainIdx]
             ret.append((p1, p2))
     assert len(ret) >= 8
     ret = np.array(ret)
-
+    idx1 = np.array(idx1)
+    idx2 = np.array(idx2)
 
     model, inliers = ransac((ret[:, 0], ret[:, 1]),
                             EssentialMatrixTransform,
@@ -88,7 +102,8 @@ def match(f1, f2):
                             max_trials=200)
     print(sum(inliers), len(inliers))
 
-    ret = ret[inliers]
-    Kt = extractRt(model.params)
+    # ignore outliers
+    # ret = ret[inliers]
+    Rt = extractRt(model.params)
 
-    return ret, Kt
+    return idx1[inliers], idx2[inliers], Rt

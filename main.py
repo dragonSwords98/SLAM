@@ -6,23 +6,22 @@ from display import Display
 from extractor import Extractor
 import numpy as np
 
-
 #actual footage: 1280 × 720
 W = 1920//2
 H = 1080//2
 
-F = 1
+F = 270
 disp = Display(W, H)
-# K = np.array(([F, 0, 0], [0, F, 0], [W//2, H//2, 1]))
 K = np.array(([F, 0, W//2], [0, F, H//2], [0, 0, 1]))
 fe = Extractor(K)
 
-# sdl2.ext.init()
-
 def process_frame(img):
   img = cv2.resize(img, (W, H))
-  matches = fe.extract(img)
+  matches, pose = fe.extract(img)
+  if pose is None:
+      return
   print("%d matches" % (len(matches)))
+  print(pose)
 
   for pt1, pt2 in matches:
       u1, v1 = fe.denormalize(pt1)

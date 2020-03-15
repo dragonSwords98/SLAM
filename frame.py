@@ -3,13 +3,13 @@ import numpy as np
 np.set_printoptions(suppress=True)
 
 from skimage.measure import ransac
-# from skimage.transform import FundamentalMatrixTransform
+from skimage.transform import FundamentalMatrixTransform
 from skimage.transform import EssentialMatrixTransform
 
 IRt = np.eye(4)
 
 class Frame(object):
-  def __init__(self, img, K):
+  def __init__(self, mapp, img, K):
     self.K = K
     self.Kinv = np.linalg.inv(self.K)
     self.pose = IRt
@@ -17,6 +17,8 @@ class Frame(object):
     pts, self.des = extract(img)
     self.pts = normalize(self.Kinv, pts)
 
+    self.id = len(mapp.frames)
+    mapp.frames.append(self)
 
 # turn [[x,y]] -> [[x, y, 1]]
 def add_ones(x):

@@ -2,7 +2,8 @@
 # https://github.com/stevenlovegrove/Pangolin/tree/master/examples/HelloPangolin
 
 import OpenGL.GL as gl
-import pypangolin as pangolin
+#import pypangolin as pangolin
+import pangolin
 
 import numpy as np
 

@@ -2,10 +2,12 @@
 
 import sys
 import cv2
-from display import Display
 from frame import Frame, denormalize, match_frames, IRt
 import numpy as np
-import g2o
+
+import OpenGL.GL as gl
+import pypangolin as pangolin
+import multiprocessing as mp
 
 # camera instrinics
 #actual footage: 1280 × 720
@@ -14,57 +16,111 @@ W, H = 1920//2, 1080//2
 F = 270
 K = np.array(([F, 0, W//2], [0, F, H//2], [0, 0, 1]))
 
+
 class Map(object):
     def __init__(self):
         self.frames = []
         self.points = []
-        # self.viewer_init()
+        self.state = None
+        self.q = mp.Queue()
 
-    # def viewer_init(self):
-    #     import OpenGL.GL as gl
-    #     import pangolin
-    #
-    #     pangolin.CreateWindowAndBind('Main', 640, 480)
-    #     gl.glEnable(gl.GL_DEPTH_TEST)
-    #
-    #     self.scam = pangolin.OpenGlRenderState(
-    #         pangolin.ProjectionMatrix(640, 480, 420, 420, 320, 240, 0.2, 100),
-    #         pangolin.ModelViewLookAt(-2, 2, -2, 0, 0, 0, pangolin.AxisDirection.AxisY))
-    #     self.handler = pangolin.Handler3D(scam)
-    #
-    #     # Create Interactive View in window
-    #     self.dcam = pangolin.CreateDisplay()
-    #     self.dcam.SetBounds(0.0, 1.0, 0.0, 1.0, -640.0 / 480.0)
-    #     self.dcam.SetHandler(self.handler)
-    #
-    # def viewer_refresh(self):
-    #     gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
-    #     gl.glClearColor(1.0, 1.0, 1.0, 1.0)
-    #     self.dcam.Activate(self.scam)
-    #
-    #     gl.glPointSize(10)
-    #     gl.glColor3f(0.0, 1.0, 0.0)
-    #     pangolin.DrawPoints(d[:3, 3] for d in self.state[0])
-    #
-    #     gl.glPointSize(2)
-    #     gl.glColor3f(0.0, 1.0, 0.0)
-    #     pangolin.DrawPoints(d for d in self.state[1])
-    #
-    #     pangolin.FinishFrame()
-    #
-    # def display(self):
-    #     poses, pts = [], []
-    #     for f in self.frames:
-    #         poses.append(f.pose)
-    #
-    #     for p in self.points:
-    #         pts.append(p.pt)
-    #
-    #     self.state = poses, pts
-    #     self.viewer_refresh()
+        p = mp.Process(target=self.viewer_thread, args=(self.q,))
+        p.daemon = True
+        p.start()
+
+    def viewer_thread(self, q):
+        self.viewer_init()
+        while 1:
+            self.viewer_refresh(q)
+
+    def viewer_init(self):
+        pangolin.CreateWindowAndBind('Main', 640, 480)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+
+        self.scam = pangolin.OpenGlRenderState(
+            pangolin.ProjectionMatrix(640, 480, 420, 420, 320, 240, 0.2, 100),
+            pangolin.ModelViewLookAt(-2, 2, -2, 0, 0, 0, pangolin.AxisDirection.AxisY))
+        self.handler = pangolin.Handler3D(self.scam)
+
+        # Create Interactive View in window
+        self.dcam = pangolin.CreateDisplay()
+        self.dcam.SetBounds(
+            pangolin.Attach(0),
+            pangolin.Attach(1),
+            pangolin.Attach.Pix(180),
+            pangolin.Attach(1),
+            -640.0 / 480.0
+        )
+        self.dcam.SetHandler(self.handler)
+
+    def viewer_refresh(self, q):
+        if self.state is None or not q.empty():
+            self.state = q.get()
+
+        # turn state into points
+        ppts = np.array([d[:3, 3] for d in self.state[0]])
+        spts = np.array(self.state[1])
+
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+        gl.glClearColor(1.0, 1.0, 1.0, 1.0)
+        self.dcam.Activate(self.scam)
+
+        gl.glPointSize(10)
+        gl.glColor3f(0.0, 1.0, 0.0)
+
+        drawPoints(ppts)
+
+        # print(ppts, spts)
+        # for i in range(ppts):
+        #     print(ppts(i))
+            # gl.glVertex3d(ppts(i, 0), ppts(i, 1), ppts(i, 2))
+
+        gl.glPointSize(2)
+        gl.glColor3f(0.0, 1.0, 0.0)
+        drawPoints(spts)
+
+        # pangolin.DrawPoints(spts)
+
+        # for i in range(spts):
+        #     print(spts(i))
+            # gl.glVertex3d(ppts(i, 0), ppts(i, 1), ppts(i, 2))
+
+        pangolin.FinishFrame()
+
+    def display(self):
+        poses, pts = [], []
+        for f in self.frames:
+            poses.append(f.pose)
+
+        for p in self.points:
+            pts.append(p.pt)
+
+        self.q.put((poses, pts))
+
+
+
+def drawPoints(ptarr):
+    # print(ptarr[0])
+    # print(ptarr[1])
+    # # r = ptarr[0]
+    gl.glBegin(gl.GL_POINTS);
+    for i in range(len(ptarr)):
+        gl.glVertex3d(ptarr[i][0], ptarr[i][1], ptarr[i][2])
+        # gl.glVertex3d(ptarr[1][0], ptarr[1][1], ptarr[1][2])
+    gl.glEnd();
+
+# void DrawPoints(py::array_t < double > points) {
+#   auto r = points.unchecked < 2 > ();
+#   glBegin(GL_POINTS);
+#   for (ssize_t i = 0; i < r.shape(0); ++i) {
+#       glVertex3d(r(i, 0), r(i, 1), r(i, 2));
+#   }
+#   glEnd();
+# }
+
 
 # main classes
-disp = Display(W, H)
+# disp = Display(W, H)
 mapp = Map()
 
 # A Point is a 3-D point in the world
@@ -121,10 +177,10 @@ def process_frame(img):
       cv2.circle(img, (u1, v1), color=(0, 255, 0), radius=3)
       cv2.line(img, (u1, v1), (u2, v2), color=(255, 0, 0))
 
-  disp.paint(img)
+  # disp.paint(img)
 
   # 3-D
-  # mapp.display()
+  mapp.display()
 
 if __name__ == "__main__":
   cap = cv2.VideoCapture(sys.argv[1])

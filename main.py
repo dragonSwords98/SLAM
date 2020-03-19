@@ -56,8 +56,8 @@ def process_frame(img):
     cv2.line(img, (u1, v1), (u2, v2), color=(255,0,0))
 
   # 2-D display
-  if disp is not None:
-    disp.paint(img)
+  # if disp is not None:
+    # disp.paint(img)
 
   # 3-D display
   mapp.display()

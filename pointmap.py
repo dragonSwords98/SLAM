@@ -1,215 +1,130 @@
+from helpers import poseRt, hamming_distance, add_ones
+from constants import CULLING_ERR_THRES
+from frame import Frame
+import time
 import numpy as np
-import OpenGL.GL as gl
-import pypangolin as pangolin
+import g2o
+import json
 
-from multiprocessing import Process, Queue
+from optimize_g2o import optimize
+#from optimize_crappy import optimize
 
+LOCAL_WINDOW = 20
+#LOCAL_WINDOW = None
 
 class Point(object):
-    # A Point is a 3-D point in the world
-    # Each Point is observed in multiple Frames
+  # A Point is a 3-D point in the world
+  # Each Point is observed in multiple Frames
 
-    def __init__(self, mapp, loc):
-        self.pt = loc
-        self.frames = []
-        self.idxs = []
+  def __init__(self, mapp, loc, color, tid=None):
+    self.pt = np.array(loc)
+    self.frames = []
+    self.idxs = []
+    self.color = np.copy(color)
+    self.id = tid if tid is not None else mapp.add_point(self)
 
-        self.id = len(mapp.points)
-        mapp.points.append(self)
+  def homogeneous(self):
+    return add_ones(self.pt)
 
-    def add_observation(self, frame, idx):
-        self.frames.append(frame)
-        self.idxs.append(idx)
+  def orb(self):
+    return [f.des[idx] for f,idx in zip(self.frames, self.idxs)]
 
+  def orb_distance(self, des):
+    return min([hamming_distance(o, des) for o in self.orb()])
+  
+  def delete(self):
+    for f,idx in zip(self.frames, self.idxs):
+      f.pts[idx] = None
+    del self
+
+  def add_observation(self, frame, idx):
+    assert frame.pts[idx] is None
+    assert frame not in self.frames
+    frame.pts[idx] = self
+    self.frames.append(frame)
+    self.idxs.append(idx)
 
 class Map(object):
-    def __init__(self):
-        self.frames = []
-        self.points = []
-        self.state = None
-        self.q = Queue()
-        self.vp = Process(target=self.viewer_thread, args=(self.q,))
-        self.vp.daemon = True
-        self.vp.start()
+  def __init__(self):
+    self.frames = []
+    self.points = []
+    self.max_frame = 0
+    self.max_point = 0
 
-    def viewer_thread(self, q):
-        self.viewer_init(1024, 768)
-        while 1:
-            self.viewer_refresh(q)
+  def serialize(self):
+    ret = {}
+    ret['points'] = [{'id': p.id, 'pt': p.pt.tolist(), 'color': p.color.tolist()} for p in self.points]
+    ret['frames'] = []
+    for f in self.frames:
+      ret['frames'].append({
+        'id': f.id, 'K': f.K.tolist(), 'pose': f.pose.tolist(), 'h': f.h, 'w': f.w, 
+        'kpus': f.kpus.tolist(), 'des': f.des.tolist(),
+        'pts': [p.id if p is not None else -1 for p in f.pts]})
+    ret['max_frame'] = self.max_frame
+    ret['max_point'] = self.max_point
+    return json.dumps(ret)
 
-    def viewer_init(self, w, h):
-        pangolin.CreateWindowAndBind('Main', w, h)
-        gl.glEnable(gl.GL_DEPTH_TEST)
+  def deserialize(self, s):
+    ret = json.loads(s)
+    self.max_frame = ret['max_frame']
+    self.max_point = ret['max_point']
+    self.points = []
+    self.frames = []
 
-        self.scam = pangolin.OpenGlRenderState(
-            pangolin.ProjectionMatrix(w, h, 420, 420, w // 2, h // 2, 0.2, 1000),
-            pangolin.ModelViewLookAt(0, -10, -8,
-                                     0, 0, 0,
-                                     0, -1, 0))
-        self.handler = pangolin.Handler3D(self.scam)
+    pids = {}
+    for p in ret['points']:
+      pp = Point(self, p['pt'], p['color'], p['id'])
+      self.points.append(pp)
+      pids[p['id']] = pp
 
-        # Create Interactive View in window
-        self.dcam = pangolin.CreateDisplay()
-        self.dcam.SetBounds(
-            pangolin.Attach(0),
-            pangolin.Attach(1),
-            pangolin.Attach(0),
-            pangolin.Attach(1),
-            -w/h
-        )
-        self.dcam.SetHandler(self.handler)
+    for f in ret['frames']:
+      ff = Frame(self, None, f['K'], f['pose'], f['id'])
+      ff.w, ff.h = f['w'], f['h']
+      ff.kpus = np.array(f['kpus'])
+      ff.des = np.array(f['des'])
+      ff.pts = [None] * len(ff.kpus)
+      for i,p in enumerate(f['pts']):
+        if p != -1:
+          ff.pts[i] = pids[p]
+      self.frames.append(ff)
 
-        # hack to avoid small Pangolin, no idea why it's *2
-        # self.dcam.Resize(pangolin.Viewport(0, 0, w * 2, h * 2))
-        # self.dcam.Activate()
+  def add_point(self, point):
+    ret = self.max_point
+    self.max_point += 1
+    self.points.append(point)
+    return ret
 
-    def viewer_refresh(self, q):
-        if self.state is None or not q.empty():
-        # while not q.empty():
-            self.state = q.get()
+  def add_frame(self, frame):
+    ret = self.max_frame
+    self.max_frame += 1
+    self.frames.append(frame)
+    return ret
 
-        # turn state into points
-        ppts = np.array([d[:3, 3] for d in self.state[0]])
-        # spts = np.array(self.state[1])
+  # *** optimizer ***
+  
+  def optimize(self, local_window=LOCAL_WINDOW, fix_points=False, verbose=False, rounds=50):
+    err = optimize(self.frames, self.points, local_window, fix_points, verbose, rounds)
 
-        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
-        gl.glClearColor(0.0, 0.0, 0.0, 1.0)
-        self.dcam.Activate(self.scam)
+    # prune points
+    culled_pt_count = 0
+    for p in self.points:
+      # <= 4 match point that's old
+      old_point = len(p.frames) <= 4 and p.frames[-1].id+7 < self.max_frame
 
-        if self.state is not None:
-            if self.state[0].shape[0] >= 2:
-                # draw poses
-                gl.glColor3f(0.0, 1.0, 0.0)
-                # pangolin.DrawCameras(self.state[0][:-1])
-                drawPoints(ppts[:-1])
-                # drawCameras(self.state[0])
+      # compute reprojection error
+      errs = []
+      for f,idx in zip(p.frames, p.idxs):
+        uv = f.kps[idx]
+        proj = np.dot(f.pose[:3], p.homogeneous())
+        proj = proj[0:2] / proj[2]
+        errs.append(np.linalg.norm(proj-uv))
 
-            if self.state[0].shape[0] >= 1:
-                # draw current pose as yellow
-                gl.glColor3f(1.0, 1.0, 0.0)
-                drawPoints(ppts[-1:])
-                # pangolin.DrawCameras(self.state[0][-1:])
+      # cull
+      if old_point or np.mean(errs) > CULLING_ERR_THRES:
+        culled_pt_count += 1
+        self.points.remove(p)
+        p.delete()
+    print("Culled:   %d points" % (culled_pt_count))
 
-            if self.state[1].shape[0] != 0:
-                # draw keypoints
-                gl.glPointSize(5)
-                gl.glColor3f(1.0, 0.0, 0.0)
-                # pangolin.DrawPoints(self.state[1], self.state[2])
-                drawPoints(self.state[1])#, self.state[2])
+    return err
 
-        pangolin.FinishFrame()
-
-    def display(self):
-        # if self.q is None:
-        #     return
-
-        poses, pts, colors = [], [], []
-        for f in self.frames:
-            # invert pose for display only
-            # poses.append(np.linalg.inv(f.pose))
-            poses.append(f.pose)
-        for p in self.points:
-            pts.append(p.pt)
-            # colors.append(p.color)
-        self.q.put((np.array(poses), np.array(pts)))#, np.array(colors) / 256.0))
-
-
-def drawCameras(ptarr):
-    w = 1.0
-    h_ratio = 0.75
-    z_ratio = 0.6
-    h = w * h_ratio;
-    z = w * z_ratio;
-
-    for i in range(ptarr.shape[0]):
-        gl.glPushMatrix();
-        print(ptarr[1])
-        gl.glMultTransposeMatrixd(ptarr[1]);
-
-        gl.glBegin(gl.GL_LINES);
-
-        gl.glVertex3f(0, 0, 0);
-        gl.glVertex3f(w, h, z);
-        gl.glVertex3f(0, 0, 0);
-        gl.glVertex3f(w, -h, z);
-        gl.glVertex3f(0, 0, 0);
-        gl.glVertex3f(-w, -h, z);
-        gl.glVertex3f(0, 0, 0);
-        gl.glVertex3f(-w, h, z);
-
-        gl.glVertex3f(w, h, z);
-        gl.glVertex3f(w, -h, z);
-
-        gl.glVertex3f(-w, h, z);
-        gl.glVertex3f(-w, -h, z);
-
-        gl.glVertex3f(-w, h, z);
-        gl.glVertex3f(w, h, z);
-
-        gl.glVertex3f(-w, -h, z);
-        gl.glVertex3f(w, -h, z);
-        gl.glEnd();
-
-        gl.glPopMatrix();
-
-
-#  void DrawCameras(py::array_t < double > cameras, float
-#     w = 1.0, float
-#     h_ratio = 0.75, float
-#     z_ratio = 0.6) {
-#         auto
-#     r = cameras.unchecked < 3 > ();
-#
-#     float
-#     h = w * h_ratio;
-#     float
-#     z = w * z_ratio;
-#
-#     for (ssize_t i = 0; i < r.shape(0); ++i) {
-#     glPushMatrix();
-#     // glMultMatrixd(r.data(i, 0, 0));
-#     glMultTransposeMatrixd(r.data(i, 0, 0));
-#
-#     glBegin(GL_LINES);
-#     glVertex3f(0, 0, 0);
-#     glVertex3f(w, h, z);
-#     glVertex3f(0, 0, 0);
-#     glVertex3f(w, -h, z);
-#     glVertex3f(0, 0, 0);
-#     glVertex3f(-w, -h, z);
-#     glVertex3f(0, 0, 0);
-#     glVertex3f(-w, h, z);
-#
-#     glVertex3f(w, h, z);
-#     glVertex3f(w, -h, z);
-#
-#     glVertex3f(-w, h, z);
-#     glVertex3f(-w, -h, z);
-#
-#     glVertex3f(-w, h, z);
-#     glVertex3f(w, h, z);
-#
-#     glVertex3f(-w, -h, z);
-#     glVertex3f(w, -h, z);
-#     glEnd();
-#
-#     glPopMatrix();
-#     }
-# }
-
-
-def drawPoints(ptarr):
-    gl.glBegin(gl.GL_POINTS);
-
-    for i in range(ptarr.shape[0]):
-        gl.glVertex3d(ptarr[i][0], ptarr[i][1], ptarr[i][2])
-    gl.glEnd();
-
-# void DrawPoints(py::array_t < double > points) {
-#   auto r = points.unchecked < 2 > ();
-#   glBegin(GL_POINTS);
-#   for (ssize_t i = 0; i < r.shape(0); ++i) {
-#       glVertex3d(r(i, 0), r(i, 1), r(i, 2));
-#   }
-#   glEnd();
-# }

@@ -1,37 +1,17 @@
+import os
 import cv2
 import numpy as np
+from scipy.spatial import cKDTree
+from constants import RANSAC_RESIDUAL_THRES, RANSAC_MAX_TRIALS
 np.set_printoptions(suppress=True)
 
 from skimage.measure import ransac
-from skimage.transform import FundamentalMatrixTransform
-from skimage.transform import EssentialMatrixTransform
+from helpers import add_ones, poseRt, fundamentalToRt, normalize, EssentialMatrixTransform, myjet
 
-# turn [[x,y]] -> [[x,y,1]]
-def add_ones(x):
-  return np.concatenate([x, np.ones((x.shape[0], 1))], axis=1)
-
-IRt = np.eye(4)
-
-# pose
-def extractRt(E):
-  W = np.mat([[0,-1,0],[1,0,0],[0,0,1]],dtype=float)
-  U,d,Vt = np.linalg.svd(E)
-  assert np.linalg.det(U) > 0
-  if np.linalg.det(Vt) < 0:
-    Vt *= -1.0
-  R = np.dot(np.dot(U, W), Vt)
-  if np.sum(R.diagonal()) < 0:
-    R = np.dot(np.dot(U, W.T), Vt)
-  t = U[:, 2]
-  ret = np.eye(4)
-  ret[:3, :3] = R
-  ret[:3, 3] = t
-  return ret
-
-def extract(img):
+def extractFeatures(img):
   orb = cv2.ORB_create()
   # detection
-  pts = cv2.goodFeaturesToTrack(np.mean(img, axis=2).astype(np.uint8), 3000, qualityLevel=0.01, minDistance=3)
+  pts = cv2.goodFeaturesToTrack(np.mean(img, axis=2).astype(np.uint8), 3000, qualityLevel=0.01, minDistance=7)
 
   # extraction
   kps = [cv2.KeyPoint(x=f[0][0], y=f[0][1], _size=20) for f in pts]
@@ -40,31 +20,35 @@ def extract(img):
   # return pts and des
   return np.array([(kp.pt[0], kp.pt[1]) for kp in kps]), des
 
-def normalize(Kinv, pts):
-  return np.dot(Kinv, add_ones(pts).T).T[:, 0:2]
-
-def denormalize(K, pt):
-  ret = np.dot(K, np.array([pt[0], pt[1], 1.0]))
-  ret /= ret[2]
-  return int(round(ret[0])), int(round(ret[1]))
-
 def match_frames(f1, f2):
   bf = cv2.BFMatcher(cv2.NORM_HAMMING)
   matches = bf.knnMatch(f1.des, f2.des, k=2)
 
   # Lowe's ratio test
   ret = []
-  idx1,idx2 = [], []
+  idx1, idx2 = [], []
+  idx1s, idx2s = set(), set()
 
   for m,n in matches:
     if m.distance < 0.75*n.distance:
-      # keep around indices
-      idx1.append(m.queryIdx)
-      idx2.append(m.trainIdx)
+      p1 = f1.kps[m.queryIdx]
+      p2 = f2.kps[m.trainIdx]
 
-      p1 = f1.pts[m.queryIdx]
-      p2 = f2.pts[m.trainIdx]
-      ret.append((p1, p2))
+      # be within orb distance 32
+      if m.distance < 32:
+        # keep around indices
+        # TODO: refactor this to not be O(N^2)
+        if m.queryIdx not in idx1s and m.trainIdx not in idx2s:
+          idx1.append(m.queryIdx)
+          idx2.append(m.trainIdx)
+          idx1s.add(m.queryIdx)
+          idx2s.add(m.trainIdx)
+          ret.append((p1, p2))
+
+  # no duplicates
+  assert(len(set(idx1)) == len(idx1))
+  assert(len(set(idx2)) == len(idx2))
+
   assert len(ret) >= 8
   ret = np.array(ret)
   idx1 = np.array(idx1)
@@ -73,27 +57,74 @@ def match_frames(f1, f2):
   # fit matrix
   model, inliers = ransac((ret[:, 0], ret[:, 1]),
                           EssentialMatrixTransform,
-                          #FundamentalMatrixTransform,
                           min_samples=8,
-                          #residual_threshold=1,
-                          residual_threshold=0.005,
-                          max_trials=200)
-  #print(sum(inliers), len(inliers))
-
-  # ignore outliers
-  Rt = extractRt(model.params)
-
-  # return
-  return idx1[inliers], idx2[inliers], Rt
+                          residual_threshold=RANSAC_RESIDUAL_THRES,
+                          max_trials=RANSAC_MAX_TRIALS)
+  print("Matches:  %d -> %d -> %d -> %d" % (len(f1.des), len(matches), len(inliers), sum(inliers)))
+  return idx1[inliers], idx2[inliers], fundamentalToRt(model.params)
 
 class Frame(object):
-  def __init__(self, mapp, img, K):
-    self.K = K
-    self.Kinv = np.linalg.inv(self.K)
-    self.pose = IRt
+  def __init__(self, mapp, img, K, pose=np.eye(4), tid=None, verts=None):
+    self.K = np.array(K)
+    self.pose = np.array(pose)
 
-    pts, self.des = extract(img)
-    self.pts = normalize(self.Kinv, pts)
+    if img is not None:
+      self.h, self.w = img.shape[0:2]
+      if verts is None:
+        self.kpus, self.des = extractFeatures(img)
+      else:
+        assert len(verts) < 256
+        self.kpus, self.des = verts, np.array(list(range(len(verts)))*32, np.uint8).reshape(32, len(verts)).T
+      self.pts = [None]*len(self.kpus)
+    else:
+      # fill in later
+      self.h, self.w = 0, 0
+      self.kpus, self.des, self.pts = None, None, None
 
-    self.id = len(mapp.frames)
-    mapp.frames.append(self)
+    self.id = tid if tid is not None else mapp.add_frame(self)
+
+  def annotate(self, img):
+    # paint annotations on the image
+    for i1 in range(len(self.kpus)):
+      u1, v1 = int(round(self.kpus[i1][0])), int(round(self.kpus[i1][1]))
+      if self.pts[i1] is not None:
+        if len(self.pts[i1].frames) >= 5:
+          cv2.circle(img, (u1, v1), color=(0,255,0), radius=3)
+        else:
+          cv2.circle(img, (u1, v1), color=(0,128,0), radius=3)
+        # draw the trail
+        pts = []
+        lfid = None
+        for f, idx in zip(self.pts[i1].frames[-9:][::-1], self.pts[i1].idxs[-9:][::-1]):
+          if lfid is not None and lfid-1 != f.id:
+            break
+          pts.append(tuple(map(lambda x: int(round(x)), f.kpus[idx])))
+          lfid = f.id
+        if len(pts) >= 2:
+          cv2.polylines(img, np.array([pts], dtype=np.int32), False, myjet[len(pts)]*255, thickness=1, lineType=16)
+      else:
+        cv2.circle(img, (u1, v1), color=(0,0,0), radius=3)
+    return img
+
+
+  # inverse of intrinsics matrix
+  @property
+  def Kinv(self):
+    if not hasattr(self, '_Kinv'):
+      self._Kinv = np.linalg.inv(self.K)
+    return self._Kinv
+
+  # normalized keypoints
+  @property
+  def kps(self):
+    if not hasattr(self, '_kps'):
+      self._kps = normalize(self.Kinv, self.kpus)
+    return self._kps
+
+  # KD tree of unnormalized keypoints
+  @property
+  def kd(self):
+    if not hasattr(self, '_kd'):
+      self._kd = cKDTree(self.kpus)
+    return self._kd
+
